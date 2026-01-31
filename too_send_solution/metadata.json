@@ -1,0 +1,4 @@
+{
+    "image": "esmonologue/infer_libs:v1",
+    "entry_point": "python infer.py"
+}  
