@@ -70,10 +70,10 @@ def get_data(data_path):
 
 
 def deal_with_razmetka(instance_data, path):
+    dirs = [os.path.join(path, x) for x in os.listdir(path)]
     if dirs is None:
         instance_data[tip]["разметка"] = None
         return
-    dirs = [os.path.join(path, x) for x in os.listdir(path)]
     if any(not os.path.isdir(x) for x in dirs):
         # одна не папка, значит все не папки, у нас один тип и привязываем к нему
         x = list(instance_data.keys())
