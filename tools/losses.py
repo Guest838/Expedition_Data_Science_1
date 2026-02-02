@@ -2,37 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Created on Nov 17 12:48:36 2021
-
-@author: Nacriema
-
-Refs:
-
-I build the collection of loss that used in Segmentation Task, beside the Standard Loss provided by Pytorch, I also
-implemented some loss that can be used to enhance the training process.
-
-For me: Loss function is computed by comparing between probabilities, so in each Loss function if we pass logit as input
-then we should convert them into probability. One-hot encoding also a form of probability.
-
-For testing purpose, we should crete ideal probability for compare them. Then I give the loss function option use soft
-max or not.
-
-Maybe I need to convert each function inside the forward pass to the function that take the input and target as softmax
-probability, inside the forward pass we just convert the logits into it
-
-
-Should use each function, because most other functions like Exponential Logarithmic Loss use the result of the defined
-function above for compute.
-
-Difference between BCELoss and CrossEntropy Loss when consider with multiple classification (n_classes >= 3):
-    - When I'm reading about the formula of CrossEntropy Loss for multiple class case, then I see the loss just
-    "include" the t*ln(p) part, but not the (1 - t)ln(1 - p)
-    for the "background" class. Then it can not "capture" the properties between each class with the background, just
-    between each class together.
-    - Then I'm reading from this thread https://github.com/ultralytics/yolov5/issues/5401, the author give me the same
-    idea.
-
-
+Refs : Multiclass losses by https://github.com/Nacriema/Loss-Functions-For-Semantic-Segmentation
+which was adapted by us for multilabel purpose, and ours loss for binary classification
 Reference papers: 
     * https://arxiv.org/pdf/2006.14822.pdf
 
@@ -40,10 +11,45 @@ Reference papers:
 import torch
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, BCELoss
 import torch.nn as nn
-import torch.nn.functional as F  # noqa
+import torch.nn.functional as F
+
+#OUR IMPLEMENTATION
+class FocalDiceLossBinary(nn.Module):
+    def __init__(self, alpha=0.75, gamma=2.0, focal_weight=0.7, dice_weight=0.3):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.focal_weight = focal_weight
+        self.dice_weight = dice_weight
+
+    @staticmethod
+    def focal_binary_loss(pred, target, alpha=0.75, gamma=2.0):
+        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        pt = torch.exp(-bce_loss)
+        focal_loss = alpha * (1 - pt) ** gamma * bce_loss
+        return focal_loss.mean()
+
+    @staticmethod
+    def dice_binary_loss(pred, target, smooth=1e-6):
+        pred_sigmoid = torch.sigmoid(pred)
+        intersection = (pred_sigmoid * target).sum()
+        dice_coef = (2. * intersection + smooth) / (
+            pred_sigmoid.sum() + target.sum() + smooth
+        )
+        return 1 - dice_coef
+
+    def forward(self, pred, target):
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(1)
+        if target.dim() == 3:
+            target = target.unsqueeze(1)
+        target = target.float()
+        focal_loss = self.focal_binary_loss(pred, target, self.alpha, self.gamma)
+        dice_loss = self.dice_binary_loss(pred, target)
+        return self.focal_weight * focal_loss + self.dice_weight * dice_loss
 
 
-# DONE #FIXED MULTILABEL
+#FIXED FOR MULTILABEL
 class FocalLoss(nn.Module):
     def __init__(self, alpha, gamma=2.0, reduction='none', eps=None):
         super(FocalLoss, self).__init__()
@@ -70,7 +76,7 @@ class FocalLoss(nn.Module):
             raise NotImplementedError(f"Invalid reduction mode: {self.reduction}")
 
 
-# DONE #FIXED MULTILABEL
+#FIXED FOR MULTILABEL
 class TverskyLoss(nn.Module):
     """
     Tversky Loss is the generalization of Dice Loss
@@ -99,34 +105,61 @@ class TverskyLoss(nn.Module):
         return 1 - torch.mean((numerator + epsilon) / (denominator + epsilon))
 
 
-# DONE
-class FocalTverskyLoss(nn.Module):
-    """
-    More information about this loss, see: https://arxiv.org/pdf/1810.07842.pdf
-    This loss is similar to Tversky Loss, but with a small adjustment
-    With input shape (batch, n_classes, h, w) then TI has shape [batch, n_classes]
-    In their paper TI_c is the tensor w.r.t to n_classes index
+#FROM https://github.com/Alibaba-MIIL/ASL?ysclid=ml3ruf5bg6325778889
+class AsymmetricLossOptimized(nn.Module):
+    ''' Notice - optimized version, minimizes memory allocation and gpu uploading,
+    favors inplace operations'''
 
-    FTL = Sum_index_c(1 - TI_c)^gamma
-    """
-    def __init__(self, gamma=1, beta=0.5, use_sigmoid=True):
-        super(FocalTverskyLoss, self).__init__()
-        self.gamma = gamma
-        self.beta = beta
-        self.use_sigmoid = use_sigmoid
+    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-8, disable_torch_grad_focal_loss=False):
+        super(AsymmetricLossOptimized, self).__init__()
 
-    def forward(self, output, target, epsilon=1e-6):
-        num_classes = output.shape[1]
-        if self.use_sigmoid:
-            output = F.sigmoid(output)  # predicted value
-        numerator = torch.sum(output * target, dim=(-2, -1))
-        denominator = numerator + self.beta * torch.sum((1 - target) * output, dim=(-2, -1)) + (
-                    1 - self.beta) * torch.sum(target * (1 - output), dim=(-2, -1))
-        TI = torch.mean((numerator + epsilon) / (denominator + epsilon), dim=0)  # Shape [batch, num_classes], should reduce along batch dim
-        return torch.sum(torch.pow(1.0 - TI, self.gamma))
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
+        self.eps = eps
 
+        # prevent memory allocation and gpu uploading every iteration, and encourages inplace operations
+        self.targets = self.anti_targets = self.xs_pos = self.xs_neg = self.asymmetric_w = self.loss = None
 
-# DONE #FIXED MULTILABEL
+    def forward(self, x, y):
+        """"
+        Parameters
+        ----------
+        x: input logits
+        y: targets (multi-label binarized vector)
+        """
+
+        self.targets = y
+        self.anti_targets = 1 - y
+
+        # Calculating Probabilities
+        self.xs_pos = torch.sigmoid(x)
+        self.xs_neg = 1.0 - self.xs_pos
+
+        # Asymmetric Clipping
+        if self.clip is not None and self.clip > 0:
+            self.xs_neg.add_(self.clip).clamp_(max=1)
+
+        # Basic CE calculation
+        self.loss = self.targets * torch.log(self.xs_pos.clamp(min=self.eps))
+        self.loss.add_(self.anti_targets * torch.log(self.xs_neg.clamp(min=self.eps)))
+
+        # Asymmetric Focusing
+        if self.gamma_neg > 0 or self.gamma_pos > 0:
+            if self.disable_torch_grad_focal_loss:
+                torch.set_grad_enabled(False)
+            self.xs_pos = self.xs_pos * self.targets
+            self.xs_neg = self.xs_neg * self.anti_targets
+            self.asymmetric_w = torch.pow(1 - self.xs_pos - self.xs_neg,
+                                          self.gamma_pos * self.targets + self.gamma_neg * self.anti_targets)
+            if self.disable_torch_grad_focal_loss:
+                torch.set_grad_enabled(True)
+            self.loss *= self.asymmetric_w
+
+        return -self.loss.sum()
+
+#FIXED FOR MULTILABEL
 class ComboLoss(nn.Module):
     """
     It is defined as a weighted sum of Dice loss and a modified cross entropy. It attempts to leverage the 
